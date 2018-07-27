@@ -38,19 +38,21 @@ open class SodiumStreamCrypto: StreamCryptoProtocol {
 
         switch algorithm {
         case .chacha20:
+            let count = outputData.count
             _ = outputData.withUnsafeMutableBytes { outputPtr in
                 iv.withUnsafeBytes { ivPtr in
                     key.withUnsafeBytes { keyPtr in
-                        crypto_stream_chacha20_xor_ic(outputPtr, outputPtr, UInt64(outputData.count), ivPtr, UInt64(counter/blockSize), keyPtr)
+                        crypto_stream_chacha20_xor_ic(outputPtr, outputPtr, UInt64(count), ivPtr, UInt64(counter/blockSize), keyPtr)
                     }
                 }
             }
 
         case .salsa20:
+            let count = outputData.count
             _ = outputData.withUnsafeMutableBytes { outputPtr in
                 iv.withUnsafeBytes { ivPtr in
                     key.withUnsafeBytes { keyPtr in
-                        crypto_stream_salsa20_xor_ic(outputPtr, outputPtr, UInt64(outputData.count), ivPtr, UInt64(counter/blockSize), keyPtr)
+                        crypto_stream_salsa20_xor_ic(outputPtr, outputPtr, UInt64(count), ivPtr, UInt64(counter/blockSize), keyPtr)
                     }
                 }
             }
