@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 open class HTTPHeader {
     public enum HTTPHeaderError: Error {
@@ -20,6 +21,12 @@ open class HTTPHeader {
     open var rawHeader: Data?
 
     public init(headerString: String) throws {
+        if #available(iOSApplicationExtension 10.0, *) {
+            os_log(">>>>>>>>>>>>> headerString:\n%{public}@", headerString)
+        } else {
+            NSLog(">>>>>>>>>>>>> headerString:\n%@", headerString)
+        }
+
         let lines = headerString.components(separatedBy: "\r\n")
         guard lines.count >= 3 else {
             throw HTTPHeaderError.malformedHeader
@@ -119,6 +126,8 @@ open class HTTPHeader {
                 }
             }
         }
+
+        self.writeToProxyLog(headerString)
     }
 
     public convenience init(headerData: Data) throws {
@@ -194,6 +203,28 @@ open class HTTPHeader {
                 return (url as NSString).substring(with: result.range(at: 1))
             } else {
                 return nil
+            }
+        }
+    }
+
+    func writeToProxyLog(_ log: String) {
+        guard let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.nielsen.emm.SimpleTunnel") else {
+            os_log("Can't get group container")
+            return
+        }
+
+        let fileURL = groupURL.appendingPathComponent("emm_vpn_proxy.log")
+        let content = String(format: "[%@] %@\n", Date().description, log)
+
+        do {
+            let fileHandle = try FileHandle(forWritingTo: fileURL)
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(content.data(using: .utf8)!)
+        } catch {
+            do {
+                try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            } catch let err {
+                os_log("Failed to create emm_vpn_proxy.log: %@", err.localizedDescription)
             }
         }
     }
