@@ -1,5 +1,6 @@
 import Foundation
 import os.log
+import SwiftScanner
 
 public class HTTPProxySocket: ProxySocket {
     enum HTTPProxyReadStatus: CustomStringConvertible {
@@ -73,8 +74,11 @@ public class HTTPProxySocket: ProxySocket {
     private var logRequestLine: String?
     private var logRequestUserAgent: String?
     private var logStartTime: Date?
-    private var isHTTPMessage = false
-    private var responseData: Data?
+    private var responseData = Data()
+    private var fullResponseLength = 0
+    private var isResponseCompleted = false
+    private var selfAddressStr: String!
+//    private let responseParser = HTTPParser(type: .Response)
 
     /**
      Begin reading and processing data from the socket.
@@ -87,6 +91,18 @@ public class HTTPProxySocket: ProxySocket {
         }
 
         logStartTime = Date()
+        selfAddressStr = String(describing: Unmanaged.passUnretained(self).toOpaque())
+
+//        responseParser.onMessageComplete { parser in
+//            self.parseResponseData()
+//            return 0
+//        }
+//
+//        responseParser.onBody { parser, ptr, len in
+//            print("\(String(cString: ptr))")
+//            return 0
+//        }
+
         readStatus = .readingFirstHeader
         socket.readDataTo(data: Utils.HTTPData.DoubleCRLF)
     }
@@ -161,10 +177,11 @@ public class HTTPProxySocket: ProxySocket {
             logRequestLine = headerComponents.first
             for headerField in headerComponents {
                 if headerField.hasPrefix("User-Agent:") {
-                    logRequestUserAgent = String(headerField.suffix(headerField.count - "User-Agent:".count))
+                    logRequestUserAgent = String(headerField.suffix(headerField.count - "User-Agent:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
 
+            os_log(">>>>>>>>>>>>>\t%{public}@\t[START]\t%{public}@", selfAddressStr, logRequestLine!)
             session = ConnectSession(host: destinationHost!, port: destinationPort!)
             observer?.signal(.receivedRequest(session!, on: self))
             delegate?.didReceive(session: session!, from: self)
@@ -200,76 +217,22 @@ public class HTTPProxySocket: ProxySocket {
         }
     }
 
-
-    private let responseHeaderBodyDelimiter = "\r\n\r\n"
-    private let headerFieldsDelimiter = "\r\n"
-
-    override public func didDisconnectWith(socket: RawTCPSocketProtocol) {
-        super.didDisconnectWith(socket: socket)
-
-        guard let data = self.responseData, let responseStr = String(data:data, encoding: .ascii) else {
-            return
-        }
-
-        let responseComponents = responseStr.components(separatedBy: responseHeaderBodyDelimiter)
-
-        let responseHeaderComponents = responseComponents.first!.components(separatedBy: headerFieldsDelimiter)
-        guard responseHeaderComponents.count >= 1 else {
-            return
-        }
-
-        let body = responseComponents.count <= 1 ? "" : responseComponents[1...responseComponents.count - 1].joined(separator:responseHeaderBodyDelimiter)
-
-        let statusLine = responseHeaderComponents.first!
-
-        let statusLineComponents = responseStr.components(separatedBy: " ")
-        if statusLine.count > 0, statusLineComponents.count >= 3, Int(statusLineComponents[1]) != nil {
-            let responseStatusCode = statusLineComponents[1]
-
-            var headerFields = [String: String]()
-            if responseHeaderComponents.count > 1 {
-                headerFields = parseHeaderFields(Array(responseHeaderComponents[1...responseHeaderComponents.count - 1]))
-            }
-
-            let now = Date()
-            let timestamp = now.description
-            let requestLine = self.logRequestLine == nil ? "-" : self.logRequestLine!
-            let requestUserAgent = self.logRequestUserAgent == nil ? "-" : self.logRequestUserAgent!
-            let contentType = headerFields["CONTENT-TYPE"] == nil ? "-" : headerFields["CONTENT-TYPE"]!
-            let referer = headerFields["REFERER"] == nil ? "-" : headerFields["REFERER"]!
-            let xdsid = headerFields["X-DSID"] == nil ? "-" : headerFields["X-DSID"]!
-            let xappleclientapp = headerFields["X-APPLE-CLIENT-APPLICATION"] == nil ? "-" : headerFields["X-APPLE-CLIENT-APPLICATION"]!
-            let duration = Int(now.timeIntervalSince(self.logStartTime == nil ? now : self.logStartTime!))
-            let bodyLength = body.count
-
-            os_log(">>>>>>>>>>>>>\t%{public}@\t%{public}@\t%{public}@\t%{public}lu\t%{public}@\t%{public}@\t%{public}@\t%{public}@\t%{public}@\t%{public}@\t%{public}@",
-                   timestamp,
-                   requestLine,
-                   responseStatusCode,
-                   bodyLength,
-                   requestUserAgent,
-                   xdsid,
-                   xappleclientapp,
-                   referer,
-                   contentType,
-                   String(data.count),
-                   String(duration))
-            writeToProxyLog("\(timestamp)\t\(requestLine)\t\(responseStatusCode)\t\(bodyLength)\t\(requestUserAgent)\t\(xdsid)\t\(xappleclientapp)\t\(referer)\t\(contentType)\t\(data.count)\t\(duration)")
-        }
-    }
-
     override public func write(data: Data) {
         super.write(data: data)
 
-        if isHTTPMessage {
-            responseData?.append(data)
-        } else {
-            guard let _ = String(data:data, encoding: .ascii) else {
-                return
-            }
+        fullResponseLength += data.count
 
-            isHTTPMessage = true
-            responseData = data
+        // save only first chunk of response data that contains status line and headers
+        // as response data takes a lot of memory and very slow to append
+        if self.responseData.count == 0 {
+            self.responseData = data
+        }
+    }
+
+    override public func didDisconnectWith(socket: RawTCPSocketProtocol) {
+        super.didDisconnectWith(socket: socket)
+        if !isResponseCompleted {
+            self.parseResponseData(forceComplete: true)
         }
     }
     
@@ -284,7 +247,7 @@ public class HTTPProxySocket: ProxySocket {
         guard !isCancelled else {
             return
         }
-        
+
         if isConnectCommand {
             writeStatus = .sendingConnectResponse
             write(data: Utils.HTTPData.ConnectSuccessResponse)
@@ -293,6 +256,99 @@ public class HTTPProxySocket: ProxySocket {
             observer?.signal(.readyForForward(self))
             delegate?.didBecomeReadyToForwardWith(socket: self)
         }
+    }
+
+    private let messageDelimiter = "\r\n"
+    private let messageDelimiterLen = 2 // define constants as Swift treats \r\n as one character and return messageDelimiter.count as 1
+
+    private func parseResponseData(forceComplete: Bool = false) {
+        guard let responseStr = String(data:self.responseData, encoding: .ascii) else {
+            return
+        }
+
+        let scanner = StringScanner(responseStr)
+        var statusLineSaved = "-"
+        var headerFields = [String: String]()
+
+        do {
+            if let statusLine = try scanner.scan(upTo: messageDelimiter) {
+                statusLineSaved = statusLine
+                try scanner.skip(length: messageDelimiterLen) // skip \r\n after status line
+
+                // Detecting message length according to RFC2616 Section 4.4 Message Length
+                if scanner.match(messageDelimiter) { // terminated response
+                    if  scanner.remainder == messageDelimiter { // terminated response
+                        logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: 0)
+                    } else {
+                        // Body w/o headers. It is possible for CONNECT requests.
+                        // We will have to read it until the connection is closed as no other way to detect the end of request body
+                    }
+                } else { // read headers
+                    if let headers = try scanner.scan(upTo: messageDelimiter + messageDelimiter) {
+                        try scanner.skip(length: 2 * messageDelimiterLen) // skip \r\n\r\n after headers to go to body
+                        headerFields = parseHeaderFields(headers.components(separatedBy: messageDelimiter))
+
+                        if scanner.isAtEnd {
+                            // no body
+                            logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: 0)
+                        } else {
+                            if let transferEncoding = headerFields["TRANSFER-ENCODING"], transferEncoding != "identity" {
+                                // chunked specified
+                                if scanner.remainder.hasSuffix(messageDelimiter + messageDelimiter) {
+                                    // final chunk received
+                                    let bodyLength = fullResponseLength - scanner.position.encodedOffset
+                                    logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: bodyLength)
+                                } else {
+                                    os_log(">>>>>>>>>>>>>\t%{public}@\t[CHUNK]\n%{public}@", selfAddressStr, responseStr)
+                                }
+                            } else if let contentLengthStr = headerFields["CONTENT-LENGTH"] {
+                                let contentLength = Int(contentLengthStr)
+                                let bodyLength = fullResponseLength - scanner.position.encodedOffset
+
+                                if contentLength == nil || contentLength != bodyLength {
+                                    os_log(">>>>>>>>>>>>>\t%{public}@\t[WARN] Content-length %{public}@ seems incorrect for body, maybe it's chunked data:\n%{public}@", selfAddressStr, contentLengthStr, scanner.remainder)
+                                } else {
+                                    logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: bodyLength)
+                                }
+                            } else {
+                                // chunked unspecified
+                                if scanner.remainder.hasSuffix(messageDelimiter + messageDelimiter) {
+                                    // final chunk received
+                                    let body = scanner.remainder.data(using: .ascii)!
+                                    logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: body.count)
+                                } else {
+                                    os_log(">>>>>>>>>>>>>\t%{public}@\t[CHUNK]\n%{public}@", selfAddressStr, responseStr)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if forceComplete && !isResponseCompleted {
+                    logResponse(responseStatusCode: parseStatusLine(statusLine), headers: headerFields, bodyLength: scanner.remainder.count)
+                }
+
+            }
+
+        } catch let error as StringScannerError {
+            os_log(">>>>>>>>>>>>>\t%{public}@\t[ERR] Parser error: %{public}@", selfAddressStr, error.localizedDescription)
+            if error == .eof {
+                logResponse(responseStatusCode: parseStatusLine(statusLineSaved), headers: headerFields, bodyLength: 0)
+            }
+        } catch let error {
+            os_log(">>>>>>>>>>>>>\t%{public}@\t[ERR] Parser error: %{public}@", selfAddressStr, error.localizedDescription)
+        }
+    }
+
+    private func parseStatusLine(_ statusLine: String) -> Int {
+        var responseStatusCode = -1
+        let statusLineComponents = statusLine.components(separatedBy: " ")
+
+        if statusLine.count > 0, statusLineComponents.count >= 3, let statusCode = Int(statusLineComponents[1]) {
+            responseStatusCode = statusCode
+        }
+
+        return responseStatusCode
     }
 
     private func parseHeaderFields(_ headers: [String])->[String: String] {
@@ -312,6 +368,35 @@ public class HTTPProxySocket: ProxySocket {
         }
 
         return headerFields
+    }
+
+    private func logResponse(responseStatusCode: Int, headers: [String: String], bodyLength: Int) {
+        isResponseCompleted = true
+
+        let now = Date()
+        let timestamp = now.description
+        let requestLine = self.logRequestLine == nil ? "-" : self.logRequestLine!
+        let requestUserAgent = self.logRequestUserAgent == nil ? "-" : self.logRequestUserAgent!
+        let contentType = headers["CONTENT-TYPE"] == nil ? "-" : headers["CONTENT-TYPE"]!
+        let referer = headers["REFERER"] == nil ? "-" : headers["REFERER"]!
+        let xdsid = headers["X-DSID"] == nil ? "-" : headers["X-DSID"]!
+        let xappleclientapp = headers["X-APPLE-CLIENT-APPLICATION"] == nil ? "-" : headers["X-APPLE-CLIENT-APPLICATION"]!
+        let duration = Int(now.timeIntervalSince(self.logStartTime == nil ? now : self.logStartTime!))
+
+        os_log(">>>>>>>>>>>>>\t%{public}@\t[END]\t%{public}@\t%{public}@\t%{public}lu\t%{public}lu\t%{public}@\t%{public}@\t%{public}@\t%{public}@\t%{public}@\t%{public}lu\t%{public}lu",
+               selfAddressStr,
+               timestamp,
+               requestLine,
+               responseStatusCode,
+               bodyLength,
+               requestUserAgent,
+               xdsid,
+               xappleclientapp,
+               referer,
+               contentType,
+               fullResponseLength,
+               duration)
+        writeToProxyLog("\(timestamp)\t\(requestLine)\t\(responseStatusCode)\t\(bodyLength)\t\(requestUserAgent)\t\(xdsid)\t\(xappleclientapp)\t\(referer)\t\(contentType)\t\(fullResponseLength)\t\(duration)\n")
     }
 
     private func writeToProxyLog(_ log: String) {
